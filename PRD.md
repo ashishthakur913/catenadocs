@@ -3,7 +3,7 @@
 **Version:** 3.0  
 **Last Updated:** 2026-02-07  
 **Scope:** Core Payment Switch, Ledger & Reconciliation  
-**Status:** Draft for Architecture Review  
+**Status:** Draft  
 **Related Documents:** [Technical Requirements Document (TRD.md)](TRD.md)
 
 ---
@@ -24,6 +24,7 @@
    - [3.9 High-Volume Merchant Scenarios](#39-high-volume-merchant-scenarios)
    - [3.10 Analytics & Derived Data](#310-analytics--derived-data)
    - [3.11 Schema Evolution & API Versioning](#311-schema-evolution--api-versioning)
+   - [3.12 Fraud Detection & Risk Scoring](#312-fraud-detection--risk-scoring)
 4. [Non-Functional Requirements & SLOs](#4-non-functional-requirements--slos)
 5. [System Constraints & Context](#5-system-constraints--context)
 6. [Data Requirements & Compliance](#6-data-requirements--compliance)
@@ -1077,100 +1078,186 @@ Catena operates globally with merchants and customers distributed across US, EU,
 
 #### 3.8.2 Scenario: Cross-Border Payment (EU Merchant, US Customer)
 
-**Context:** German merchant (data must stay in EU) processes payment from US customer using a US-issued card.
+**Context:** German merchant (data must stay in EU per GDPR) processes payment from US customer using a US-issued card. A US-based acquirer may offer better authorization rates for US-issued cards — but the merchant's data must remain in the EU.
+
+**Key Tension:** The optimal PSP/acquirer for a US-issued card may be US-based, but all cardholder data (PAN, customer PII) and payment state must remain within Catena's EU infrastructure. The system must route optimally without moving sensitive data outside EU boundaries.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant M as Merchant (DE)
     participant EU as Catena EU
-    participant US as Catena US
-    participant PSP as US Acquirer
+    participant PSP as US Acquirer (External)
     
     M->>EU: Create payment (US-issued card)
     EU->>EU: Create payment record (EU region)
     EU->>EU: Tokenize card (EU vault)
-    
-    Note over EU,US: Routing decision: US acquirer optimal for US card
-    
-    EU->>US: Forward for PSP routing (token only, no PII)
-    US->>PSP: Authorization request
-    PSP-->>US: Approved
-    US-->>EU: Authorization result
+    EU->>EU: Routing decision (BIN lookup: US card → US acquirer optimal)
+    EU->>EU: Resolve token → PAN (EU vault, never leaves EU infra)
+    EU->>PSP: Authorization request with PAN (TLS, cross-border API call)
+    PSP-->>EU: Approved
     EU->>EU: Update payment state + ledger (EU)
     EU-->>M: Success: authorized
 ```
+
+**GDPR Note:** Transmitting PAN to an external PSP (a data processor under a Data Processing Agreement) for the purpose of completing a transaction is permitted under GDPR. The constraint is that PAN and customer PII must never be stored or processed within **Catena's own** non-EU infrastructure.
 
 **Requirements:**
 
 | Requirement ID | Requirement | Acceptance Criteria |
 |----------------|-------------|---------------------|
-| XBORDER-001 | Customer PII remains in merchant's designated region | PAN, email, address never cross region boundary |
-| XBORDER-002 | Tokens can be resolved cross-region for PSP calls | Token lookup works from any region |
-| XBORDER-003 | Payment state always authoritative in merchant's region | No split-brain on payment status |
-| XBORDER-004 | Cross-region latency overhead < 100ms | Measured end-to-end |
+| XBORDER-001 | Customer PII (PAN, email, address) never leaves Catena's merchant-designated region | No PII stored or processed in any Catena region other than the merchant's designated region |
+| XBORDER-002 | Non-sensitive routing metadata (card brand, BIN range, issuer country) available in all regions for routing decisions | Routing computation does not require PAN or PII access |
+| XBORDER-003 | Payment state and ledger entries authoritative in merchant's region only | No split-brain on payment status |
+| XBORDER-004 | Cross-border PSP calls (EU infra → US acquirer) add acceptable latency | End-to-end latency for cross-border ≤ 200ms above domestic baseline |
+| XBORDER-005 | Token resolution (PAN retrieval) only occurs within the vault's own region | No cross-region PAN transmission within Catena infrastructure |
 
 #### 3.8.3 Scenario: Regional Failover During Active Transaction
 
-**Context:** EU region experiences complete outage while payments are in-flight.
+**Context:** An availability zone within the EU region (EU-West) experiences complete outage while payments are in-flight. Traffic must fail over to the standby zone (EU-Central) within the same data residency boundary.
+
+##### Sub-scenario A: Intra-Region Failover (Zone Failure)
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant M as Merchant
-    participant EU as Catena EU
-    participant US as Catena US (Failover)
+    participant EUW as Catena EU-West
+    participant EUC as Catena EU-Central (Failover)
     participant PSP as PSP
     
-    M->>EU: Create payment
-    EU->>EU: Create payment (CREATED)
-    EU->>PSP: Authorization request
+    M->>EUW: Create payment
+    EUW->>EUW: Create payment (CREATED)
+    EUW->>PSP: Authorization request
     
-    Note over EU: Region failure
+    Note over EUW: Zone failure
     
-    EU--xM: Connection lost
+    EUW--xM: Connection lost
     
     Note over M: Merchant times out, retries
     
-    M->>US: Create payment (same idempotency key)
-    US->>US: Check idempotency store
+    M->>EUC: Create payment (same idempotency key)
+    EUC->>EUC: Check idempotency store
     
     alt Key replicated before failure
-        US->>US: Found key, status PENDING
-        US->>PSP: Query payment status
-        PSP-->>US: Authorized
-        US-->>M: Success: authorized
+        EUC->>EUC: Found key, status PENDING
+        EUC->>PSP: Query payment status
+        PSP-->>EUC: Authorized
+        EUC-->>M: Success: authorized
     else Key NOT replicated before failure
-        US->>PSP: New authorization attempt
+        EUC->>PSP: New authorization attempt
         Note over PSP: PSP-level idempotency prevents duplicate charge
-        PSP-->>US: Authorized (same charge)
-        US-->>M: Success: authorized
+        PSP-->>EUC: Authorized (same charge)
+        EUC-->>M: Success: authorized
     end
     
-    Note over EU,US: After EU recovery: reconciliation runs
+    Note over EUW,EUC: After zone recovery: reconciliation runs
 ```
+
+##### Sub-scenario B: Entire Region Failure (Continent-Wide Outage)
+
+**Context:** All EU availability zones are simultaneously unreachable (e.g., continent-wide cloud provider failure, major network incident). EU merchants have in-flight payments and the only available Catena infrastructure is in US and APAC.
+
+**This is a genuine tension between availability and data residency:**
+
+| Option | Availability | GDPR Compliance | Customer Impact |
+|--------|-------------|-----------------|------------------|
+| **Reject all EU payments until EU recovers** | ❌ Total outage for EU merchants | ✅ No data leaves EU | Merchants lose all revenue during outage |
+| **Process in US with full data** | ✅ Payments continue | ❌ EU data in US infrastructure | Regulatory risk, potential fines |
+| **Accept payment intent, defer processing** | ⚠️ Degraded (no authorization) | ✅ No data leaves EU | Merchant can't confirm payment |
+| **Process with minimal data, reconcile later** | ⚠️ Partial | ⚠️ Depends on what data crosses | Complex reconciliation |
 
 **Requirements:**
 
 | Requirement ID | Requirement | Acceptance Criteria |
 |----------------|-------------|---------------------|
-| FAILOVER-001 | No duplicate charges during regional failover | PSP-level idempotency as backup |
+| FAILOVER-001 | No duplicate charges during zone failover | PSP-level idempotency as backup |
 | FAILOVER-002 | Merchant receives definitive response within 5 minutes | Either success, failure, or actionable status |
-| FAILOVER-003 | Failover region can serve read requests for any merchant | Read replicas available cross-region |
-| FAILOVER-004 | Failover region can process writes for critical operations | Writes may be degraded but not blocked |
-| FAILOVER-005 | Post-recovery reconciliation identifies all affected transactions | Automated scan within 1 hour of recovery |
+| FAILOVER-003 | Intra-region failover preserves all data residency guarantees | Failover zone is within the same data residency boundary |
+| FAILOVER-004 | Each data residency region (US, EU, APAC) must have ≥2 independent availability zones | No single zone failure causes regional outage |
+| FAILOVER-005 | Post-recovery reconciliation identifies all affected transactions | Automated scan within 1 hour of zone recovery |
+| FAILOVER-006 | System defines an explicit policy for continent-wide region failure | Policy documented, reviewed by legal and compliance, tested annually |
+| FAILOVER-007 | Cross-region failover (if permitted by policy) must never persist PII in the failover region beyond the recovery window | Temporary processing only; data purged upon home region recovery |
 
 #### 3.8.4 Scenario: Network Partition Between Regions
 
-**Context:** Network connectivity lost between US and EU regions, but both regions remain operational internally. This is the classic split-brain problem.
+**Context:** Network connectivity lost between US-East and US-West regions, but both regions remain operational internally. This is the classic split-brain problem.
 
 **Split-Brain Problem:** Both regions might accept writes for the same merchant, leading to conflicting states.
 
-**Product Decisions for CAP Trade-offs During Partition:**
+**Concrete Example: Uber Rate Configuration Split-Brain**
+
+Uber processes payments through Catena across both US-East and US-West. During a network partition, two Uber operations engineers make conflicting changes simultaneously:
+
+```
+Timeline:
+  T0: Network partition occurs between US-East and US-West
+  T1: Engineer A (US-East) updates Uber's routing preference: "Prefer PSP Stripe for all US cards"  
+  T2: Engineer B (US-West) updates Uber's routing preference: "Prefer PSP Adyen for all US cards"
+  T3: Customer Alice (routed to US-East) pays $50 → routed to Stripe (per Engineer A's config)
+  T4: Customer Bob (routed to US-West) pays $50 → routed to Adyen (per Engineer B's config)
+  T5: Partition heals — which routing config wins? Both regions accepted a write.
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant EA as Engineer A
+    participant UE as Catena US-East
+    participant UW as Catena US-West
+    participant EB as Engineer B
+    participant Alice as Alice (Customer)
+    participant Bob as Bob (Customer)
+
+    Note over UE,UW: ⚡ Network partition — regions cannot communicate
+
+    par Conflicting config writes
+        EA->>UE: Update Uber routing: prefer Stripe
+        UE->>UE: Accept write (no quorum check — favoring availability)
+        EB->>UW: Update Uber routing: prefer Adyen
+        UW->>UW: Accept write (no quorum check — favoring availability)
+    end
+
+    Note over UE,UW: Uber now has TWO different routing configs
+
+    par Customer payments hit different regions
+        Alice->>UE: Pay $50 (US-East)
+        UE->>UE: Route to Stripe (Engineer A's config)
+        Bob->>UW: Pay $50 (US-West)
+        UW->>UW: Route to Adyen (Engineer B's config)
+    end
+
+    Note over UE,UW: ✅ Partition heals
+
+    UE->>UW: Sync: Uber routing = "prefer Stripe" (T1)
+    UW->>UE: Sync: Uber routing = "prefer Adyen" (T2)
+    Note over UE,UW: CONFLICT — last-writer-wins? Merge? Manual resolution?
+```
+
+**Why This Is Dangerous:**
+
+| Impact | Description |
+|--------|-------------|
+| **Inconsistent routing** | During the partition, identical payments from Uber's customers are routed to different PSPs depending on which region handles them. This makes Uber's interchange cost reports unreliable. |
+| **Configuration conflict** | After partition heals, the system must reconcile two conflicting versions of Uber's routing preferences. Neither is "wrong" — both were accepted by an available region. |
+| **Financial reporting divergence** | If Stripe charges 2.1% and Adyen charges 1.8%, Uber's cost analytics are skewed differently per region during the partition window. Reconciliation reports won't match expectations. |
+| **Audit trail fork** | The event logs in each region show a different history of configuration changes. Merging these into a single consistent timeline requires conflict resolution logic. |
+
+**Additional split-brain data risks for a single merchant:**
+
+| Data Type | US-East State | US-West State | Conflict |
+|-----------|--------------|--------------|----------|
+| Webhook URL | Updated to `https://uber.com/hooks/v2` | Still `https://uber.com/hooks/v1` | Events delivered to different endpoints |
+| Rate limit tier | Upgraded to "Enterprise" (50k TPS) | Still "Growth" (10k TPS) | One region throttles, the other doesn't |
+| Merchant balance | $1,200,000 (reflects Stripe settlements) | $1,185,000 (reflects Adyen settlements) | Balances diverge — which is authoritative? |
+| Refund policy | Refund window changed to 90 days | Still 180 days | Same refund request accepted in one region, rejected in the other |
+
+**Expected System Behavior During Partition:**
 
 | Operation | Behavior During Partition | Rationale |
 |----------|--------------------------|-----------|
 | Payment creation | **Favor availability** (accept in both partitions) | Customer experience; PSP idempotency prevents duplicate charges |
+| Merchant config changes | **Favor consistency** (reject in minority partition) | Conflicting configs cause downstream inconsistencies as shown above |
 | Capture / Void / Refund | **Favor consistency** (reject in minority partition) | Financial accuracy critical; can retry after partition heals |
 | Read operations | **Favor availability** (serve potentially stale data) | Eventual consistency acceptable for reads |
 | Ledger writes | **Favor consistency** (reject in minority partition) | Financial audit trail must be accurate |
@@ -1179,11 +1266,13 @@ sequenceDiagram
 
 | Requirement ID | Requirement | Acceptance Criteria |
 |----------------|-------------|---------------------|
-| PARTITION-001 | System applies the CAP decisions above per operation type | Explicit, tested per-operation behavior |
+| PARTITION-001 | System applies the partition behavior defined above per operation type | Explicit, tested per-operation behavior |
 | PARTITION-002 | If availability chosen: Conflicts must be detectable post-partition | Conflict detection within 1 hour of partition healing |
 | PARTITION-003 | If consistency chosen: Writes rejected in minority partition with clear error | Merchant receives actionable error message |
 | PARTITION-004 | Partition detection time < 30 seconds | System detects and adapts quickly |
 | PARTITION-005 | Merchant dashboard shows degraded status during partition | Visible indicator |
+| PARTITION-006 | Merchant configuration changes require quorum and must not be accepted during partition | No conflicting config states possible |
+| PARTITION-007 | Post-partition reconciliation produces a conflict report for any divergent merchant data | Ops team can review and resolve within 4 hours |
 
 #### 3.8.5 Scenario: Read-After-Write Consistency
 
@@ -1198,11 +1287,6 @@ sequenceDiagram
 | RYW-001 | Merchant always sees their own writes immediately | Read-your-writes consistency guaranteed |
 | RYW-002 | Solution must not significantly impact read latency | P99 read latency < 50ms overhead |
 | RYW-003 | Solution must work across regional failover | Consistency maintained post-failover |
-
-**Acceptable Approaches (Product Perspective -- architect to decide implementation):**
-1. Route merchant's reads to the same node that handled their recent write
-2. Include a consistency token in write response; require it on subsequent reads
-3. Block read until replication confirmed
 
 #### 3.8.6 Scenario: Merchant Data Migration Between Regions
 
@@ -1389,6 +1473,88 @@ The system maintains several derived views from the primary event log:
 
 ---
 
+### 3.12 Fraud Detection & Risk Scoring
+
+**Purpose:** Catena must evaluate every transaction for fraud risk before authorization. This component protects merchants from fraudulent transactions, reduces chargeback rates, and is a regulatory expectation for payment processors.
+
+#### 3.12.1 Fraud Risk Evaluation Requirements
+
+| Requirement ID | Requirement | Acceptance Criteria |
+|----------------|-------------|---------------------|
+| FRAUD-001 | Every payment must receive a risk score before authorization is attempted | Risk score present on 100% of payment records |
+| FRAUD-002 | Risk evaluation must complete within its latency budget without blocking the payment pipeline | P99 fraud evaluation time measurably below total payment latency SLO |
+| FRAUD-003 | If the fraud system is unavailable, payments must still be processed | Fallback policy applied; payments processed with a "risk_not_evaluated" flag |
+| FRAUD-004 | Merchants can configure risk thresholds: auto-approve, review, auto-decline | Per-merchant risk policy configuration |
+| FRAUD-005 | Risk score must incorporate real-time signals (transaction velocity, amount patterns, geographic anomalies) | Score changes when velocity or pattern changes |
+| FRAUD-006 | Risk score must incorporate historical signals (chargeback history, customer reputation) | Known-fraud cards score higher risk |
+| FRAUD-007 | Fraud decisions must be explainable (which signals contributed) | Risk breakdown available for every scored transaction |
+
+#### 3.12.2 Feature Store Requirements
+
+Fraud scoring depends on **features** — precomputed signals derived from transaction history. Examples:
+
+| Feature | Description | Freshness Requirement |
+|---------|-------------|----------------------|
+| Card velocity (1h) | Number of transactions on this card in the past hour | Near-real-time (< 60 seconds) |
+| Card velocity (24h) | Number of transactions on this card in the past 24 hours | Near-real-time (< 5 minutes) |
+| Merchant chargeback rate | Ratio of chargebacks to total transactions for this merchant | Hourly |
+| Geographic distance | Distance between customer's billing address and IP geolocation | Real-time (per-request computation) |
+| Average transaction amount | Customer's typical transaction size | Daily |
+| Device fingerprint history | How many cards have been used from this device | Near-real-time (< 5 minutes) |
+| BIN risk score | Historical fraud rate for this card BIN range | Weekly |
+
+| Requirement ID | Requirement | Acceptance Criteria |
+|----------------|-------------|---------------------|
+| FRAUD-008 | Feature store must serve features at P99 latency compatible with the fraud evaluation budget | Feature lookup does not dominate the fraud latency budget |
+| FRAUD-009 | Feature store tolerates staleness — slightly outdated features are acceptable, unavailable features are not acceptable | Stale features served from cache; missing features trigger a default/degraded score rather than a failure |
+| FRAUD-010 | Features derived from the same event stream as the rest of the system | No separate data pipeline for fraud; fraud features are derived views of the payment event log |
+| FRAUD-011 | Feature values must be consistent for a given transaction (no mid-evaluation updates) | Snapshot semantics for feature reads during a single risk evaluation |
+
+#### 3.12.3 Model Lifecycle Requirements
+
+| Requirement ID | Requirement | Acceptance Criteria |
+|----------------|-------------|---------------------|
+| FRAUD-012 | Risk models can be updated without system downtime | Model deployment is a zero-downtime operation |
+| FRAUD-013 | Multiple model versions can run simultaneously (shadow mode, A/B testing) | New model scored alongside production model; results compared |
+| FRAUD-014 | Model rollback within minutes if performance degrades | Previous model version restorable without redeployment |
+| FRAUD-015 | Models trained on historical transaction data without accessing production databases | Training pipeline reads from derived/replicated data, not operational stores |
+| FRAUD-016 | Model updates must propagate to all regions | All regions use compatible model versions (eventual consistency acceptable, but bounded staleness) |
+
+#### 3.12.4 Scenarios
+
+**Scenario A: Fraud System Outage During Flash Sale**
+
+A merchant's flash sale drives 30,000 TPS. The fraud scoring system becomes overloaded and stops responding. What happens?
+
+| Option | Effect on Merchants | Effect on Fraud Protection |
+|--------|--------------------|--------------------------|
+| Block all payments until fraud system recovers | Merchant loses revenue; customers abandon | 100% fraud coverage maintained |
+| Process all payments without fraud scoring | No revenue loss | Unknown fraud exposure during outage window |
+| Apply simplified rules (static thresholds) as fallback | Minimal revenue impact | Reduced but non-zero fraud protection |
+
+*The system must define which option (or combination) applies, and how the decision varies by merchant risk tier.*
+
+**Scenario B: Cross-Region Feature Consistency**
+
+A fraudster uses the same stolen card in EU and US within seconds. The EU fraud system computes "card velocity = 1" and the US fraud system also computes "card velocity = 1" because the feature stores haven't synchronized yet. Neither region sees the full picture.
+
+| Requirement ID | Requirement | Acceptance Criteria |
+|----------------|-------------|---------------------|
+| FRAUD-017 | The system must define how cross-region feature propagation delay affects fraud detection | Documented acceptable window for cross-region feature staleness |
+| FRAUD-018 | High-risk signals (e.g., confirmed fraud flags) must propagate across regions faster than general features | Fraud flags propagated within a tighter SLA than general feature updates |
+
+**Scenario C: Model Accuracy vs. Authorization Rate**
+
+An overly aggressive fraud model declines 3% of legitimate transactions (false positives), costing merchants revenue. A permissive model lets through 0.5% more fraud (false negatives), costing merchants chargebacks. There is no "correct" answer — this is a business decision that the system must support configurably.
+
+| Requirement ID | Requirement | Acceptance Criteria |
+|----------------|-------------|---------------------|
+| FRAUD-019 | Merchants can adjust their fraud sensitivity (conservative vs. permissive) | At least 3 sensitivity tiers available |
+| FRAUD-020 | System tracks false positive rate (legitimate transactions declined) and false negative rate (fraud not caught) | Metrics available per merchant, per model version |
+| FRAUD-021 | Fraud model performance visible to merchants via dashboard | Merchants see their block rate, chargeback rate, and review rate |
+
+---
+
 ## 4. Non-Functional Requirements & SLOs
 
 ### 4.1 Definitions
@@ -1467,7 +1633,7 @@ The system maintains several derived views from the primary event log:
 
 | Constraint | Description |
 |-----------|-------------|
-| **Team Size** | 3 engineers (initially) -- architecture must account for small team maintainability |
+| **Team Size** | 3 engineers (initially) |
 | **Budget** | Startup-grade -- cost efficiency matters; avoid over-engineering but design for growth |
 | **Timeline** | MVP in 3 months -- core payment flow, single region, 2 PSPs |
 | **Deployment** | Cloud-native (target: major cloud provider). No on-premise requirement |
@@ -1484,7 +1650,7 @@ The system maintains several derived views from the primary event log:
 
 ### 5.4 Regulatory Constraints
 
-| Regulation | Impact on Architecture |
+| Regulation | Impact |
 |-----------|----------------------|
 | GDPR | EU customer data must stay in EU. Right to deletion. Data processing agreements required |
 | PCI-DSS Level 1 | PAN must be isolated in a Cardholder Data Environment (CDE). Annual QSA audit. Network segmentation required |
@@ -1708,10 +1874,10 @@ flowchart TD
 
 | ID | Test Case | Expected Result |
 |----|-----------|-----------------|
-| MR-001 | Cross-border payment (EU merchant, US card) | PAN stays in EU, PSP via US, success |
-| MR-002 | Regional failover: read request | Failover region serves read |
-| MR-003 | Regional failover: write request | No duplicate charge |
-| MR-004 | Network partition between regions | Per-operation CAP decisions applied |
+| MR-001 | Cross-border payment (EU merchant, US card) | PAN stays in EU Catena infra, EU calls US PSP directly, success |
+| MR-002 | Intra-region zone failover: read request | Failover zone serves read |
+| MR-003 | Intra-region zone failover: write request | No duplicate charge |
+| MR-004 | Network partition between regions | Per-operation partition decisions applied |
 | MR-005 | Read-after-write same merchant | Payment visible immediately |
 | MR-006 | Post-partition reconciliation | All conflicts identified within 1 hour |
 | MR-007 | Cross-region idempotency key | Same key honored regardless of region |
@@ -1745,6 +1911,16 @@ flowchart TD
 | DE-002 | Rolling deploy: old and new code coexist | Both read/write data correctly |
 | DE-003 | Event log replay after schema change | Events still deserializable |
 
+#### 9.2.11 Fraud Detection & Risk Scoring (Must Pass: 100%)
+
+| ID | Test Case | Expected Result |
+|----|-----------|------------------|
+| FR-001 | Payment submitted | Risk score present on payment record |
+| FR-002 | Fraud system unavailable | Payment processed with fallback policy, flagged as risk_not_evaluated |
+| FR-003 | Same card used rapidly across 2 regions | Velocity feature eventually reflects both; documented staleness window |
+| FR-004 | Model update deployed | Zero-downtime swap, old and new model coexist |
+| FR-005 | Merchant adjusts fraud sensitivity | Subsequent payments scored with new threshold |
+
 ### 9.3 Performance Test Scenarios
 
 | Scenario | Duration | Load Profile | Success Criteria |
@@ -1758,20 +1934,20 @@ flowchart TD
 
 ### 9.4 Chaos Engineering Tests
 
-| Test | Injection | Expected Behavior | Learning Focus |
-|------|-----------|-------------------|----------------|
-| PSP network partition | Block traffic to primary PSP | Route to secondary within 5s | Fault tolerance |
-| Database leader failure | Kill primary DB node | Replica promoted, no data loss | Replication, failover |
-| Application node crash | Kill random node | Load redistributed | Stateless design |
-| Full AZ failure | Disable availability zone | Traffic to other AZ | High availability |
-| Cross-region partition | Block traffic between US and EU | Per-operation CAP decisions | CAP theorem |
-| Replication lag simulation | Introduce delay on replicas | Read-your-writes maintained | Consistency |
-| Split-brain scenario | Both regions believe they are primary | Conflict detection fires | Consensus |
-| Hot partition simulation | 90% traffic to single shard | Graceful degradation or rebalancing | Partitioning |
-| Clock skew | Introduce clock drift | System detects and handles | Distributed clocks |
-| Webhook queue overflow | Fill queue for one merchant | Other merchants unaffected | Isolation |
-| Long-running transaction | Hold locks for extended time | Deadlock detection, rollback | Transactions |
-| Recovery worker partition | Worker can't reach PSP | Backoff, no infinite retry | Failure handling |
+| Test | Injection | Expected Behavior |
+|------|-----------|-------------------|
+| PSP network partition | Block traffic to primary PSP | Route to secondary within 5s |
+| Database leader failure | Kill primary DB node | Replica promoted, no data loss |
+| Application node crash | Kill random node | Load redistributed |
+| Full AZ failure | Disable availability zone | Traffic to other AZ |
+| Cross-region partition | Block traffic between US and EU | Per-operation partition decisions applied |
+| Replication lag simulation | Introduce delay on replicas | Read-your-writes maintained |
+| Split-brain scenario | Both regions believe they are primary | Conflict detection fires |
+| Hot partition simulation | 90% traffic to single shard | Graceful degradation or rebalancing |
+| Clock skew | Introduce clock drift | System detects and handles |
+| Webhook queue overflow | Fill queue for one merchant | Other merchants unaffected |
+| Long-running transaction | Hold locks for extended time | Deadlock detection, rollback |
+| Recovery worker partition | Worker can't reach PSP | Backoff, no infinite retry |
 
 ### 9.5 Sign-off Criteria
 
@@ -1811,5 +1987,6 @@ flowchart TD
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-01-15 | First draft |
-| 2.0 | 2026-02-04 | Complete restructure per learning goals |
+| 2.0 | 2026-02-04 | Complete restructure |
 | 3.0 | 2026-02-07 | Separated concerns (PRD vs TRD). Added: NFR/SLO spec, system constraints, data requirements, traffic forecasts, security requirements. Added analytics/derived data and schema evolution requirements. Removed implementation details (moved to TRD) |
+| 3.1 | 2026-02-22 | Fixed GDPR compliance issues in 3.8.2 (cross-border) and 3.8.3 (failover). Resolved XBORDER-001/002 conflict. Changed failover to intra-region with continent-wide failure scenario. Removed duplicate 3.8.4 section. Added Section 3.12: Fraud Detection & Risk Scoring |

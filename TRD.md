@@ -1045,6 +1045,33 @@ PRD Section 3.8.4 defines specific product decisions:
 
 ---
 
+### 6.9 Fraud Detection & Feature Store Architecture
+
+*Related PRD sections: [3.12 Fraud Detection & Risk Scoring](PRD.md#312-fraud-detection--risk-scoring)*
+
+| Question | Context | DDIA Concepts |
+|----------|---------|---------------|
+| How do we serve features at low latency while keeping them reasonably fresh? | Feature store must serve card velocity, merchant risk, etc. within the fraud latency budget | Derived data, caching, materialized views |
+| What consistency model does the feature store need? | Stale features are tolerable, missing features are not. Cross-region staleness affects fraud detection (Scenario B in PRD 3.12.5) | Eventual consistency, bounded staleness |
+| How do we handle the fraud system being unavailable? | PRD requires fail-open behavior — payments continue without risk scores. What data do we log for after-the-fact analysis? | Failure modes, graceful degradation |
+| How do features get computed from the event stream? | Same event log drives both operational state and fraud features, but with different consistency requirements | Stream processing, windowed aggregations |
+| How do we propagate high-risk signals (confirmed fraud) across regions faster than general features? | PRD FRAUD-018 requires tighter SLA for fraud flags | Cross-region replication, priority propagation |
+| How do we deploy model updates across regions without downtime? | Models must be updatable, rollback-able, and A/B testable (PRD FRAUD-012 through FRAUD-016) | Rolling deployments, feature flags |
+| How do we isolate fraud system load from the core payment pipeline? | Fraud scoring runs inline with every payment but must not increase payment latency | Backpressure, circuit breakers, sidecar vs inline |
+
+**Feature Store Design Considerations:**
+
+| Feature Type | Update Trigger | Staleness Tolerance | Computation Model |
+|-------------|---------------|---------------------|-------------------|
+| Card velocity (short window) | Every transaction | < 60 seconds | Stream processing (windowed count) |
+| Card velocity (long window) | Every transaction | < 5 minutes | Stream processing or periodic batch |
+| Merchant chargeback rate | Chargeback events | < 1 hour | Stream processing (ratio over window) |
+| BIN risk score | Weekly fraud analysis | < 1 week | Batch processing |
+| Device fingerprint history | Every transaction | < 5 minutes | Stream processing (set accumulation) |
+| Customer reputation | Chargeback + refund events | < 1 hour | Stream processing (decay function) |
+
+---
+
 ### 6.8 Recovery & Consistency Verification
 
 | Question | Context | DDIA Concepts |
@@ -1088,6 +1115,12 @@ PRD Section 3.8.4 defines specific product decisions:
 | ADR-006 | Event log technology | Pending | PRD 3.6, 3.10 | Ch. 11 Stream Processing |
 | ADR-007 | Reconciliation batch architecture | Pending | PRD 3.7 | Ch. 10 Batch Processing |
 | ADR-008 | Data encoding/schema evolution | Pending | PRD 3.11 | Ch. 4 Encoding and Evolution |
+| ADR-009 | Primary data store selection | Pending | PRD 6.2 | Ch. 2-3 Data Models, Storage |
+| ADR-010 | Ledger storage engine | Pending | PRD 3.3.4 | Ch. 3 Storage and Retrieval |
+| ADR-011 | Fraud feature store architecture | Pending | PRD 3.12 | Ch. 11 Stream Processing, Ch. 3 Storage |
+| ADR-012 | Fraud system failure mode and fallback policy | Pending | PRD 3.12.5 | Ch. 8 Trouble with Distributed Systems |
+| ADR-013 | Cross-border PSP routing from home region | Pending | PRD 3.8.2 | Ch. 5 Replication (routing metadata replication) |
+| ADR-014 | Continent-wide failure policy (data residency vs availability) | Pending | PRD 3.8.3 | Ch. 9 Consistency and Consensus |
 
 ---
 
@@ -1107,6 +1140,9 @@ PRD Section 3.8.4 defines specific product decisions:
 | **Event Sourcing** | Immutable event log as system of record | Ch. 11 |
 | **Change Data Capture** | Derived views from primary data | Ch. 11 |
 | **MapReduce / Batch** | Daily reconciliation processing | Ch. 10 |
+| **Materialized Views** | Feature store for fraud scoring (pre-computed aggregates) | Ch. 3, 11 |
+| **Stream-Table Duality** | Fraud features as materialized stream output | Ch. 11 |
+| **Graceful Degradation** | Fraud system unavailability fallback | Ch. 8 |
 
 ---
 
@@ -1117,3 +1153,4 @@ PRD Section 3.8.4 defines specific product decisions:
 | 1.0 | 2026-02-04 | Initial — Extracted from PRD v2.0 |
 | 1.1 | 2026-02-04 | Expanded open technical questions, added DDIA learning prompts |
 | 2.0 | 2026-02-07 | Major restructure: absorbed all implementation details from PRD v3.0 (API specs, JSON examples, SQL schemas, algorithm formulas, token format, retry config, settlement CSV format). Added stream processing, batch processing, and schema evolution questions. Expanded ADR tracking |
+| 2.1 | 2026-02-22 | Added Section 6.9 (Fraud Detection & Feature Store open questions). Added ADR-009 through ADR-012. Added reference patterns for materialized views, stream-table duality, graceful degradation |
